@@ -1,0 +1,131 @@
+name: Build SEAPATH Release
+run-name: Build SEAPATH with id ${{ inputs.build_id || github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        type: string
+        required: false
+        description: Release build identifier shared across all projects.
+
+permissions: read-all
+
+concurrency:
+  group: seapath-release-${{ inputs.build_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    name: Dispatch and wait for release builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set build ID (default to timestamp if not provided)
+        run: |
+          BUILD_ID='${{ inputs.build_id }}'
+          if [ -z "$BUILD_ID" ]; then
+            BUILD_ID=$(date +%F-%H-%M-%S)
+          fi
+          echo "BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: SEAPATH
+          repositories: |
+            yocto-bsp
+            build_debian_iso
+            seapath-installer
+            seapath-live-installer
+          permission-actions: write
+
+      - name: Dispatch and wait for upstream builds
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workflow_file="build-and-s3-upload.yml"
+          upstream_repos=(yocto-bsp build_debian_iso seapath-installer)
+          declare -A run_ids
+
+          poll_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          for repo in "${upstream_repos[@]}"; do
+            ref=$(gh api "/repos/SEAPATH/${repo}" --jq .default_branch)
+            gh workflow run "$workflow_file" \
+              --repo "SEAPATH/${repo}" \
+              --ref "$ref" \
+              --field build_id="$BUILD_ID"
+          done
+
+          for _ in $(seq 1 120); do
+            for repo in "${upstream_repos[@]}"; do
+              if [ -n "${run_ids[$repo]:-}" ]; then
+                continue
+              fi
+
+              ref=$(gh api "/repos/SEAPATH/${repo}" --jq .default_branch)
+              run_id=$(gh api "/repos/SEAPATH/${repo}/actions/workflows/${workflow_file}/runs?event=workflow_dispatch&branch=${ref}&per_page=50" \
+                --jq "(.workflow_runs | map(select(.display_title == \"Build ${BUILD_ID}\" and .created_at >= \"${poll_started_at}\")) | sort_by(.created_at) | last | .id) // empty")
+
+              if [ -n "$run_id" ]; then
+                run_ids[$repo]="$run_id"
+              fi
+            done
+
+            if [ "${#run_ids[@]}" -eq "${#upstream_repos[@]}" ]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ "${#run_ids[@]}" -ne "${#upstream_repos[@]}" ]; then
+            echo "Timed out waiting for upstream workflow runs to appear" >&2
+            exit 1
+          fi
+
+          for repo in "${upstream_repos[@]}"; do
+            gh run watch "${run_ids[$repo]}" --repo "SEAPATH/${repo}" --exit-status
+          done
+
+      - name: Dispatch and wait for live installer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workflow_file="build-and-s3-upload.yml"
+          repo="seapath-live-installer"
+          ref=$(gh api "/repos/SEAPATH/${repo}" --jq .default_branch)
+          poll_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          gh workflow run "$workflow_file" \
+            --repo "SEAPATH/${repo}" \
+            --ref "$ref" \
+            --field build_id="$BUILD_ID"
+
+          run_id=""
+          for _ in $(seq 1 120); do
+            run_id=$(gh api "/repos/SEAPATH/${repo}/actions/workflows/${workflow_file}/runs?event=workflow_dispatch&branch=${ref}&per_page=50" \
+              --jq "(.workflow_runs | map(select(.display_title == \"Build ${BUILD_ID}\" and .created_at >= \"${poll_started_at}\")) | sort_by(.created_at) | last | .id) // empty")
+
+            if [ -n "$run_id" ]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "Timed out waiting for live installer workflow run to appear" >&2
+            exit 1
+          fi
+
+          gh run watch "$run_id" --repo "SEAPATH/${repo}" --exit-status
